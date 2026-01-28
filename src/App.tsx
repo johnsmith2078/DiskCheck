@@ -12,21 +12,35 @@ import {
 import * as React from "react";
 
 import { Treemap } from "./components/Treemap";
+import { VirtualList } from "./components/VirtualList";
 import { Button } from "./components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "./components/ui/card";
 import {
   type FsNode,
   type ScanProgressPayload,
-  findNodeByPath,
   getChildren,
-  parentPath,
 } from "./lib/fs";
 import { formatBytes } from "./lib/format";
+
+const TREEMAP_MIN_FILE_SIZE_OPTIONS = [
+  { label: "1 MB", bytes: 1 * 1024 * 1024 },
+  { label: "5 MB", bytes: 5 * 1024 * 1024 },
+  { label: "10 MB", bytes: 10 * 1024 * 1024 },
+  { label: "50 MB", bytes: 50 * 1024 * 1024 },
+  { label: "100 MB", bytes: 100 * 1024 * 1024 },
+  { label: "500 MB", bytes: 500 * 1024 * 1024 },
+  { label: "1 GB", bytes: 1024 * 1024 * 1024 },
+] as const;
 
 export default function App() {
   const [selectedPath, setSelectedPath] = React.useState<string | null>(null);
   const [root, setRoot] = React.useState<FsNode | null>(null);
-  const [focusPath, setFocusPath] = React.useState<string | null>(null);
+  // Keep a stack of nodes from root -> current focus to avoid O(n) path lookups
+  // on every navigation (which becomes very noticeable on large scans).
+  const [focusStack, setFocusStack] = React.useState<FsNode[]>([]);
+  const [treemapMinFileBytes, setTreemapMinFileBytes] = React.useState<number>(
+    TREEMAP_MIN_FILE_SIZE_OPTIONS[2].bytes,
+  );
 
   const [isScanning, setIsScanning] = React.useState(false);
   const [progress, setProgress] = React.useState<ScanProgressPayload | null>(
@@ -46,22 +60,14 @@ export default function App() {
 
   const focusNode = React.useMemo(() => {
     if (!root) return null;
-    if (!focusPath) return root;
-    return findNodeByPath(root, focusPath) ?? root;
-  }, [root, focusPath]);
+    return focusStack[focusStack.length - 1] ?? root;
+  }, [root, focusStack]);
 
   const focusChildren = React.useMemo(() => {
     return getChildren(focusNode);
   }, [focusNode]);
 
-  const parentFocusPath = React.useMemo(() => {
-    return focusNode ? parentPath(focusNode.path) : null;
-  }, [focusNode]);
-
-  const canFocusUp = React.useMemo(() => {
-    if (!root || !parentFocusPath) return false;
-    return Boolean(findNodeByPath(root, parentFocusPath));
-  }, [root, parentFocusPath]);
+  const canFocusUp = focusStack.length > 1;
 
   async function pickDirectory() {
     setError(null);
@@ -69,7 +75,7 @@ export default function App() {
     if (typeof result === "string") {
       setSelectedPath(result);
       setRoot(null);
-      setFocusPath(null);
+      setFocusStack([]);
       setProgress(null);
     }
   }
@@ -80,13 +86,13 @@ export default function App() {
     setError(null);
     setIsScanning(true);
     setRoot(null);
-    setFocusPath(null);
+    setFocusStack([]);
     setProgress({ scannedFiles: 0, scannedDirs: 0, totalBytes: 0 });
 
     try {
       const tree = await invoke<FsNode>("scan_directory", { path: selectedPath });
       setRoot(tree);
-      setFocusPath(tree.path);
+      setFocusStack([tree]);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -103,9 +109,7 @@ export default function App() {
   }
 
   function focusUp() {
-    if (!root || !focusNode || !parentFocusPath) return;
-    if (!findNodeByPath(root, parentFocusPath)) return;
-    setFocusPath(parentFocusPath);
+    setFocusStack((stack) => (stack.length > 1 ? stack.slice(0, -1) : stack));
   }
 
   return (
@@ -186,19 +190,23 @@ export default function App() {
             </div>
           </div>
 
-          <div className="h-[calc(100%-168px)] overflow-auto px-2 pb-6">
-            {focusNode ? (
-              <div className="space-y-1">
-                {focusChildren.map((node) => {
+          {focusNode ? (
+            focusChildren.length ? (
+              <VirtualList
+                className="h-[calc(100%-168px)] px-2"
+                items={focusChildren}
+                itemHeight={52}
+                paddingEnd={24}
+                getKey={(node) => node.path}
+                renderItem={(node) => {
                   const Icon = node.kind === "directory" ? Folder : File;
                   return (
                     <button
-                      key={node.path}
                       type="button"
-                      className="group flex w-full items-center justify-between gap-3 rounded-md px-3 py-2 text-left transition-colors hover:bg-accent/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                      className="group flex h-full w-full items-center justify-between gap-3 rounded-md px-3 py-2 text-left transition-colors hover:bg-accent/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                       onClick={() =>
                         node.kind === "directory"
-                          ? setFocusPath(node.path)
+                          ? setFocusStack((stack) => [...stack, node])
                           : reveal(node.path)
                       }
                     >
@@ -218,14 +226,22 @@ export default function App() {
                       </div>
                     </button>
                   );
-                })}
-              </div>
+                }}
+              />
             ) : (
+              <div className="h-[calc(100%-168px)] overflow-auto px-2 pb-6">
+                <div className="px-3 text-sm text-muted-foreground">
+                  Empty folder.
+                </div>
+              </div>
+            )
+          ) : (
+            <div className="h-[calc(100%-168px)] overflow-auto px-2 pb-6">
               <div className="px-3 text-sm text-muted-foreground">
                 No data yet.
               </div>
-            )}
-          </div>
+            </div>
+          )}
         </aside>
 
         <main className="min-w-0 flex-1 p-4">
@@ -238,20 +254,44 @@ export default function App() {
                   </div>
                   <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 font-mono text-[11px] text-muted-foreground">
                     <span>size: {formatBytes(focusNode.size)}</span>
-                    <span>items: {getChildren(focusNode).length}</span>
+                    <span>items: {focusChildren.length}</span>
                   </div>
                 </div>
-                <Button
-                  variant="outline"
-                  onClick={() => reveal(focusNode.path)}
-                  disabled={isScanning}
-                >
-                  Reveal
-                </Button>
+                <div className="flex items-center gap-2">
+                  <div className="flex items-center gap-2">
+                    <div className="text-xs text-muted-foreground">
+                      Treemap ≥
+                    </div>
+                    <select
+                      className="h-9 rounded-md border border-input bg-background px-2 text-sm shadow-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                      value={String(treemapMinFileBytes)}
+                      onChange={(e) => setTreemapMinFileBytes(Number(e.target.value))}
+                      disabled={isScanning}
+                      aria-label="Minimum file size for treemap"
+                    >
+                      {TREEMAP_MIN_FILE_SIZE_OPTIONS.map((opt) => (
+                        <option key={opt.bytes} value={String(opt.bytes)}>
+                          {opt.label}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  <Button
+                    variant="outline"
+                    onClick={() => reveal(focusNode.path)}
+                    disabled={isScanning}
+                  >
+                    Reveal
+                  </Button>
+                </div>
               </div>
 
               <div className="min-h-0 flex-1">
-                <Treemap data={focusNode} onRevealPath={reveal} />
+                <Treemap
+                  data={focusNode}
+                  onRevealPath={reveal}
+                  minFileBytes={treemapMinFileBytes}
+                />
               </div>
             </div>
           ) : (
