@@ -1,8 +1,12 @@
 mod scanner;
 
 #[tauri::command]
-async fn scan_directory(window: tauri::Window, path: String) -> Result<scanner::FsNode, String> {
-    scanner::scan_directory(window, path).await
+async fn scan_directory(
+    window: tauri::Window,
+    path: String,
+    min_node_bytes: Option<u64>,
+) -> Result<scanner::FsNode, String> {
+    scanner::scan_directory(window, path, min_node_bytes).await
 }
 
 #[tauri::command]
