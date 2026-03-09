@@ -12,12 +12,12 @@ use std::{
 use tauri::Emitter;
 
 const SCAN_PROGRESS_EVENT: &str = "scan_progress";
-// NOTE: Returning the full file tree for large folders can crash the WebView IPC
-// serialization. We defensively prune the returned tree while still calculating
-// accurate directory sizes.
-const DEFAULT_MIN_NODE_BYTES: u64 = 1 * 1024 * 1024; // 1 MiB
-const DEFAULT_MAX_CHILDREN_PER_DIR: usize = 1_000;
-const DEFAULT_MAX_TOTAL_NODES: usize = 10_000;
+// NOTE: Returning every file node for large folders can crash the WebView IPC
+// serialization. We keep directory nodes intact for navigation, but prune file
+// nodes defensively while still calculating accurate directory sizes.
+const DEFAULT_MIN_FILE_BYTES: u64 = 1 * 1024 * 1024; // 1 MiB
+const DEFAULT_MAX_FILES_PER_DIR: usize = 1_000;
+const DEFAULT_MAX_TOTAL_FILE_NODES: usize = 10_000;
 
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -146,37 +146,48 @@ fn error_node(path: &Path, kind: FsNodeKind, err: impl ToString) -> FsNode {
 
 #[derive(Debug, Clone, Copy)]
 struct ScanOptions {
-    min_node_bytes: u64,
-    max_children_per_dir: usize,
-    max_total_nodes: usize,
+    min_file_bytes: u64,
+    max_files_per_dir: usize,
+    max_total_file_nodes: usize,
 }
 
 #[derive(Debug, Default)]
 struct ScanStats {
     skipped_entries: u64,
-    hit_node_limit: bool,
+    hidden_file_nodes: u64,
+    hit_file_limit: bool,
 }
 
 #[derive(Debug)]
 struct DirFrame {
     path: PathBuf,
     name: String,
-    depth: usize,
     iter: ReadDir,
     // Total size of this directory (includes filtered-out children).
     size: u64,
-    // Children we actually return to the UI (pruned for IPC safety).
-    children: Vec<FsNode>,
+    // Non-file children are kept so directory navigation remains complete.
+    other_children: Vec<FsNode>,
+    // File children are pruned for IPC safety.
+    file_children: Vec<FsNode>,
+    hidden_file_nodes: u64,
 }
 
-fn maybe_keep_child(children: &mut Vec<FsNode>, child: FsNode, max_children_per_dir: usize) {
-    children.push(child);
-
-    // Keep only the largest items to reduce IPC payload. We avoid sorting on every insert.
-    if children.len() >= max_children_per_dir.saturating_mul(2) {
-        children.sort_by(|a, b| b.size.cmp(&a.size));
-        children.truncate(max_children_per_dir);
+fn maybe_keep_file_child(files: &mut Vec<FsNode>, child: FsNode, max_files_per_dir: usize) -> u64 {
+    if max_files_per_dir == 0 {
+        return 1;
     }
+
+    files.push(child);
+
+    // Keep only the largest files to reduce IPC payload. We avoid sorting on every insert.
+    if files.len() >= max_files_per_dir.saturating_mul(2) {
+        files.sort_by(|a, b| b.size.cmp(&a.size));
+        let removed = files.len().saturating_sub(max_files_per_dir);
+        files.truncate(max_files_per_dir);
+        return removed as u64;
+    }
+
+    0
 }
 
 fn scan_pruned_tree(root: &Path, progress: &ProgressReporter, opts: ScanOptions) -> Result<FsNode, String> {
@@ -240,14 +251,15 @@ fn scan_pruned_tree(root: &Path, progress: &ProgressReporter, opts: ScanOptions)
     let mut stack: Vec<DirFrame> = vec![DirFrame {
         path: root.to_path_buf(),
         name: display_name(root),
-        depth: 0,
         iter: read_dir,
         size: 0,
-        children: vec![],
+        other_children: vec![],
+        file_children: vec![],
+        hidden_file_nodes: 0,
     }];
 
     let mut stats = ScanStats::default();
-    let mut returned_nodes: usize = 1; // root
+    let mut returned_file_nodes: usize = 0;
 
     progress.dir_scanned(root);
 
@@ -263,15 +275,32 @@ fn scan_pruned_tree(root: &Path, progress: &ProgressReporter, opts: ScanOptions)
 
                 let meta = match fs::symlink_metadata(&child_path) {
                     Ok(m) => m,
-                    Err(_) => {
+                    Err(err) => {
                         stats.skipped_entries = stats.skipped_entries.saturating_add(1);
+                        if let Some(frame) = stack.last_mut() {
+                            frame.other_children.push(error_node(
+                                &child_path,
+                                FsNodeKind::Other,
+                                format!("Failed to read metadata: {}", err),
+                            ));
+                        }
                         continue;
                     }
                 };
 
                 let file_type = meta.file_type();
                 if file_type.is_symlink() {
-                    // Skip symlinks for safety and to reduce noise.
+                    if let Some(frame) = stack.last_mut() {
+                        frame.other_children.push(FsNode {
+                            name: display_name(&child_path),
+                            path: child_path.to_string_lossy().into_owned(),
+                            kind: FsNodeKind::Symlink,
+                            size: 0,
+                            children: vec![],
+                            extension: file_extension_lower(&child_path),
+                            error: None,
+                        });
+                    }
                     continue;
                 }
 
@@ -283,11 +312,11 @@ fn scan_pruned_tree(root: &Path, progress: &ProgressReporter, opts: ScanOptions)
                         frame.size = frame.size.saturating_add(size);
                     }
 
-                    if size >= opts.min_node_bytes && returned_nodes < opts.max_total_nodes {
-                        returned_nodes += 1;
+                    if size >= opts.min_file_bytes && returned_file_nodes < opts.max_total_file_nodes {
+                        returned_file_nodes += 1;
                         if let Some(frame) = stack.last_mut() {
-                            maybe_keep_child(
-                                &mut frame.children,
+                            let hidden = maybe_keep_file_child(
+                                &mut frame.file_children,
                                 FsNode {
                                     name: display_name(&child_path),
                                     path: child_path.to_string_lossy().into_owned(),
@@ -297,11 +326,19 @@ fn scan_pruned_tree(root: &Path, progress: &ProgressReporter, opts: ScanOptions)
                                     extension: file_extension_lower(&child_path),
                                     error: None,
                                 },
-                                opts.max_children_per_dir,
+                                opts.max_files_per_dir,
                             );
+                            frame.hidden_file_nodes =
+                                frame.hidden_file_nodes.saturating_add(hidden);
+                            stats.hidden_file_nodes =
+                                stats.hidden_file_nodes.saturating_add(hidden);
                         }
-                    } else if size >= opts.min_node_bytes {
-                        stats.hit_node_limit = true;
+                    } else if size >= opts.min_file_bytes {
+                        stats.hit_file_limit = true;
+                        stats.hidden_file_nodes = stats.hidden_file_nodes.saturating_add(1);
+                        if let Some(frame) = stack.last_mut() {
+                            frame.hidden_file_nodes = frame.hidden_file_nodes.saturating_add(1);
+                        }
                     }
 
                     continue;
@@ -313,25 +350,41 @@ fn scan_pruned_tree(root: &Path, progress: &ProgressReporter, opts: ScanOptions)
                     match fs::read_dir(&child_path) {
                         Ok(rd) => {
                             let name = display_name(&child_path);
-                            let depth = stack.last().map(|f| f.depth).unwrap_or(0);
                             stack.push(DirFrame {
                                 path: child_path,
                                 name,
-                                depth: depth + 1,
                                 iter: rd,
                                 size: 0,
-                                children: vec![],
+                                other_children: vec![],
+                                file_children: vec![],
+                                hidden_file_nodes: 0,
                             });
                         }
-                        Err(_) => {
-                            // Permission denied / system folder etc. Skip (do not panic, do not include).
+                        Err(err) => {
                             stats.skipped_entries = stats.skipped_entries.saturating_add(1);
+                            if let Some(frame) = stack.last_mut() {
+                                frame.other_children.push(error_node(
+                                    &child_path,
+                                    FsNodeKind::Directory,
+                                    format!("Failed to read directory: {}", err),
+                                ));
+                            }
                         }
                     }
                     continue;
                 }
 
-                // Non-file, non-dir: ignore.
+                if let Some(frame) = stack.last_mut() {
+                    frame.other_children.push(FsNode {
+                        name: display_name(&child_path),
+                        path: child_path.to_string_lossy().into_owned(),
+                        kind: FsNodeKind::Other,
+                        size: 0,
+                        children: vec![],
+                        extension: file_extension_lower(&child_path),
+                        error: None,
+                    });
+                }
             }
             Some(Err(_)) => {
                 // Error reading a single entry; skip and continue.
@@ -344,11 +397,19 @@ fn scan_pruned_tree(root: &Path, progress: &ProgressReporter, opts: ScanOptions)
                     None => break,
                 };
 
-                let mut children = completed.children;
-                children.sort_by(|a, b| b.size.cmp(&a.size));
-                if children.len() > opts.max_children_per_dir {
-                    children.truncate(opts.max_children_per_dir);
+                let mut hidden_file_nodes = completed.hidden_file_nodes;
+                let mut file_children = completed.file_children;
+                file_children.sort_by(|a, b| b.size.cmp(&a.size));
+                if file_children.len() > opts.max_files_per_dir {
+                    let removed = file_children.len() - opts.max_files_per_dir;
+                    hidden_file_nodes = hidden_file_nodes.saturating_add(removed as u64);
+                    stats.hidden_file_nodes = stats.hidden_file_nodes.saturating_add(removed as u64);
+                    file_children.truncate(opts.max_files_per_dir);
                 }
+
+                let mut children = completed.other_children;
+                children.extend(file_children);
+                children.sort_by(|a, b| b.size.cmp(&a.size));
 
                 let mut node = FsNode {
                     name: completed.name,
@@ -357,35 +418,40 @@ fn scan_pruned_tree(root: &Path, progress: &ProgressReporter, opts: ScanOptions)
                     size: completed.size,
                     children,
                     extension: None,
-                    error: None,
+                    error: (hidden_file_nodes > 0).then(|| {
+                        format!(
+                            "Hidden {} file entries in this folder for stability.",
+                            hidden_file_nodes
+                        )
+                    }),
                 };
-
-                // Only keep large subtrees to protect IPC. Always keep the root node.
-                let keep_this = completed.depth == 0
-                    || (node.size >= opts.min_node_bytes && returned_nodes < opts.max_total_nodes);
-
-                if completed.depth != 0 && node.size >= opts.min_node_bytes && returned_nodes >= opts.max_total_nodes {
-                    stats.hit_node_limit = true;
-                }
 
                 if let Some(parent) = stack.last_mut() {
                     parent.size = parent.size.saturating_add(node.size);
-                    if keep_this && completed.depth != 0 {
-                        returned_nodes += 1;
-                        maybe_keep_child(&mut parent.children, node, opts.max_children_per_dir);
-                    }
+                    parent.other_children.push(node);
                 } else {
                     // Root completed.
-                    if stats.hit_node_limit {
-                        node.error = Some(format!(
-                            "Result truncated to <= {} nodes for stability. Increase the minimum size filter to reduce output.",
-                            opts.max_total_nodes
+                    let mut notices: Vec<String> = vec![];
+                    if stats.hidden_file_nodes > 0 {
+                        notices.push(format!(
+                            "Hidden {} file entries for stability.",
+                            stats.hidden_file_nodes
                         ));
-                    } else if stats.skipped_entries > 0 {
-                        node.error = Some(format!(
-                            "Skipped {} entries due to permission/errors.",
+                    }
+                    if stats.hit_file_limit {
+                        notices.push(format!(
+                            "File results were capped at {} entries across the scan.",
+                            opts.max_total_file_nodes
+                        ));
+                    }
+                    if stats.skipped_entries > 0 {
+                        notices.push(format!(
+                            "{} entries could not be read completely.",
                             stats.skipped_entries
                         ));
+                    }
+                    if !notices.is_empty() {
+                        node.error = Some(notices.join(" "));
                     }
                     return Ok(node);
                 }
@@ -411,9 +477,9 @@ pub async fn scan_directory(
         let progress = ProgressReporter::new(window_clone);
         progress.emit_force(Some(&root));
         let opts = ScanOptions {
-            min_node_bytes: min_node_bytes.unwrap_or(DEFAULT_MIN_NODE_BYTES),
-            max_children_per_dir: DEFAULT_MAX_CHILDREN_PER_DIR,
-            max_total_nodes: DEFAULT_MAX_TOTAL_NODES,
+            min_file_bytes: min_node_bytes.unwrap_or(DEFAULT_MIN_FILE_BYTES),
+            max_files_per_dir: DEFAULT_MAX_FILES_PER_DIR,
+            max_total_file_nodes: DEFAULT_MAX_TOTAL_FILE_NODES,
         };
         let node = scan_pruned_tree(&root, &progress, opts)?;
         progress.emit_force(Some(&root));

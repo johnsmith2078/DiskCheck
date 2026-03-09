@@ -286,6 +286,12 @@ export default function App() {
                 </div>
               </div>
 
+              {focusNode.error ? (
+                <div className="rounded-lg border border-amber-500/40 bg-amber-500/10 p-3 text-xs text-amber-800">
+                  {focusNode.error}
+                </div>
+              ) : null}
+
               <div className="min-h-0 flex-1">
                 <Treemap
                   data={focusNode}
